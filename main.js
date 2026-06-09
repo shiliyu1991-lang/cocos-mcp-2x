@@ -327,17 +327,6 @@ function adbDelete(urls) {
     });
 }
 
-function adbRefresh(url) {
-    return new Promise((resolve, reject) => {
-        try {
-            Editor.assetdb.refresh(url, (err) => {
-                if (err) return reject(_err(err));
-                resolve(true);
-            });
-        } catch (e) { reject(_err(e)); }
-    });
-}
-
 // --- Editor.Scene.callSceneScript -> Promise wrapper ---
 // All live scene-graph work happens in scene.js (the scene process, where the
 // engine `cc` runtime lives). We reach it by name; only JSON crosses the wire.
@@ -349,6 +338,21 @@ function callScene(method, ...args) {
                 if (err) return reject(_err(err));
                 resolve(result);
             });
+        } catch (e) { reject(_err(e)); }
+    });
+}
+
+// --- Editor-managed scene IPC -> Promise wrapper ---
+// Scene MUTATIONS must go through the scene panel's own commands (the same ones
+// the Hierarchy/Inspector use): they record Undo AND mark the scene dirty, so a
+// later save actually writes them. Raw `cc` edits in scene.js do NOT persist.
+// Requires a scene to be open (the 'scene' panel must be loaded).
+function sceneIpc(msg, ...args) {
+    return new Promise((resolve, reject) => {
+        try {
+            Editor.Ipc.sendToPanel('scene', 'scene:' + msg, ...args,
+                (err, result) => (err ? reject(_err(err)) : resolve(result)),
+                30000);
         } catch (e) { reject(_err(e)); }
     });
 }
@@ -490,8 +494,12 @@ const handlers = {
 
         if (action === 'refresh') {
             const url = _normUrl(params.url) || 'db://assets';
-            await adbRefresh(url);
-            return { refreshed: true, url: url };
+            // Fire-and-forget: refreshing a compiled .js/.fire can trigger a slow
+            // recompile + scene reload whose callback may exceed the bridge
+            // timeout. Kick it off and return immediately; completion is async
+            // (watch read_console). See KNOWN_ISSUES Bug 2.
+            try { Editor.assetdb.refresh(url, function () {}); } catch (e) { throw _err(e); }
+            return { refreshing: true, url: url };
         }
 
         throw new Error('manage_asset: unknown action "' + action +
@@ -525,8 +533,14 @@ const handlers = {
         }
 
         if (action === 'save') {
-            // Same message the editor's Ctrl+S triggers.
-            Editor.Ipc.sendToMain('scene:save-scene');
+            // Save via the scene panel (the same path Ctrl+S takes). The managed
+            // mutations above mark the scene dirty, so this actually writes.
+            try {
+                await sceneIpc('save-scene');
+            } catch (e) {
+                // Fallback for builds where save is main-routed.
+                try { Editor.Ipc.sendToMain('scene:save-scene'); } catch (e2) { throw e; }
+            }
             return { saved: true };
         }
 
@@ -555,28 +569,50 @@ const handlers = {
         }
 
         if (action === 'create') {
-            return await callScene('nodeCreate', {
-                name: params.name || 'NewNode',
-                parentUuid: params.parentUuid || null,
-                position: params.position || null,
-            });
+            // Resolve the parent (default = scene root) so the managed command
+            // always gets an explicit uuid.
+            let parentUuid = params.parentUuid;
+            if (!parentUuid) {
+                const cur = await callScene('sceneCurrent');
+                parentUuid = (cur && cur.uuid) || '';
+            }
+            const name = params.name || 'NewNode';
+            // classid '' => a plain cc.Node. Reply is the new node's uuid.
+            const uuid = await sceneIpc('create-node-by-classid', name, '', parentUuid);
+            if (params.position && uuid) {
+                const p = params.position;
+                await sceneIpc('set-property', {
+                    id: uuid, path: 'position', type: 'cc.Vec3',
+                    value: { x: p.x || 0, y: p.y || 0, z: p.z || 0 }, isSubProp: false,
+                });
+            }
+            return { created: true, uuid: uuid, name: name, parentUuid: parentUuid };
         }
 
         if (action === 'delete') {
             if (!params.uuid) throw new Error('manage_node.delete needs uuid');
-            return await callScene('nodeDelete', params.uuid);
+            await sceneIpc('delete-nodes', [params.uuid]);
+            return { deleted: true, uuid: params.uuid };
         }
 
         if (action === 'add_component') {
             if (!params.uuid) throw new Error('manage_node.add_component needs uuid');
             if (!params.className) throw new Error('manage_node.add_component needs className');
-            return await callScene('nodeAddComponent', params.uuid, params.className);
+            const componentId = await sceneIpc('add-component', params.uuid, params.className);
+            return { added: true, uuid: params.uuid, component: params.className, componentId: componentId };
         }
 
         if (action === 'set_property') {
             if (!params.uuid) throw new Error('manage_node.set_property needs uuid');
             if (!params.property) throw new Error('manage_node.set_property needs property');
-            return await callScene('nodeSetProperty', params.uuid, params.property, params.value);
+            // Resolve target id (node or component uuid) + dump path + type in the
+            // scene process, then apply via the managed set-property command.
+            const r = await callScene('nodeResolveProp', params.uuid, params.property);
+            if (!r || !r.id) throw new Error('could not resolve property: ' + params.property);
+            await sceneIpc('set-property', {
+                id: r.id, path: r.path, type: r.type, value: params.value, isSubProp: !!r.isSubProp,
+            });
+            return { set: true, uuid: params.uuid, property: params.property, on: r.on, type: r.type };
         }
 
         throw new Error('manage_node: unknown action "' + action +

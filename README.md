@@ -148,10 +148,13 @@ cocos-mcp-2x/
 
 ## 已知限制
 
-- **节点编辑通过 `scene.js` 直接调用 `cc` 引擎完成**，会在保存场景时持久化，但可能不进入编辑器的
-  撤销（Undo）历史。复杂改动建议保存前在编辑器里核对。
-- `manage_scene` 的 `open` / `save` 通过 2.x 场景模块的 IPC 消息触发（`scene:open-by-uuid` /
-  `scene:save-scene`），是异步的。
+- **节点编辑（create / delete / add_component / set_property）走编辑器受管命令**
+  `Editor.Ipc.sendToPanel('scene', 'scene:…')`，会进 Undo 历史并标脏，`manage_scene save` 后正常落盘。
+  **前提是已打开一个场景**（场景面板需处于加载状态）；没有打开场景时这些操作会直接报错。
+  `scene.js` 仅做只读查询（tree/get/current）。
+- `manage_asset refresh` 是 **fire-and-forget**：立即返回 `{refreshing:true}`，刷新/重编译在后台进行，
+  用 `read_console` 或重新查询确认完成。
+- `manage_scene open` 通过 `scene:open-by-uuid` 触发，异步切换场景。
 - `read_console` 捕获的是**扩展主进程**经由 `Editor.log` 家族输出的日志（尽力而为）。
 
 ## 环境要求

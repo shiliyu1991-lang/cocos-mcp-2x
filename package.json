@@ -1,6 +1,6 @@
 {
   "name": "cocos-mcp-2x",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "MCP bridge for Cocos Creator 2.4.x — connects (as a client) to a Python MCP server over WebSocket. Self-contained, no npm dependencies.",
   "author": "cocosMcp",
   "main": "main.js",

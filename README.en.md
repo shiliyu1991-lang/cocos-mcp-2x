@@ -151,10 +151,13 @@ cocos-mcp-2x/
 
 ## Known limitations
 
-- **Node edits go straight through the `cc` engine in `scene.js`.** They persist on scene save but
-  may not enter the editor's Undo history. Review before saving for complex changes.
-- `manage_scene` `open` / `save` trigger the 2.x scene module's IPC messages
-  (`scene:open-by-uuid` / `scene:save-scene`) and are asynchronous.
+- **Node edits (create / delete / add_component / set_property) go through the editor-managed
+  commands** `Editor.Ipc.sendToPanel('scene', 'scene:…')`, so they enter the Undo history, mark the
+  scene dirty, and persist on `manage_scene save`. This **requires an open scene** (the scene panel
+  must be loaded); with no scene open these actions error. `scene.js` only does read-only queries.
+- `manage_asset refresh` is **fire-and-forget**: it returns `{refreshing:true}` immediately while the
+  reimport/recompile runs in the background — confirm completion via `read_console` or a re-query.
+- `manage_scene open` triggers `scene:open-by-uuid` and switches scene asynchronously.
 - `read_console` captures logs emitted by the **extension main process** via the `Editor.log`
   family (best-effort).
 

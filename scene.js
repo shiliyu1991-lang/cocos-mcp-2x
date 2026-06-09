@@ -13,6 +13,13 @@
  * Each handler receives `(event, ...args)` and replies with
  * `event.reply(errString|null, data)`. Only JSON-serializable data may cross
  * the IPC boundary — we always return plain objects, never live cc.Node refs.
+ *
+ * This script is READ-ONLY: queries (sceneCurrent / nodeTree / nodeGet /
+ * nodeResolveProp) and the eval escape hatch. Scene MUTATIONS (create / delete /
+ * add-component / set-property) are NOT done here — raw `cc` edits bypass the
+ * editor's dirty/Undo system and would not persist on save. main.js performs
+ * them via the editor-managed `Editor.Ipc.sendToPanel('scene', 'scene:…')`
+ * commands instead; this script only resolves the dump path/type for them.
  */
 
 // `cc` is a global in the 2.4 scene process (no require needed).
@@ -33,11 +40,6 @@ function _node(uuid) {
     if (!uuid) return _scene();
     const n = cc.engine && cc.engine.getInstanceById ? cc.engine.getInstanceById(uuid) : null;
     return n || null;
-}
-
-function _repaint() {
-    try { if (cc.engine && cc.engine.repaintInEditMode) cc.engine.repaintInEditMode(); }
-    catch (e) { /* ignore */ }
 }
 
 function _trimTree(node, maxDepth, depth) {
@@ -80,48 +82,26 @@ function _nodeSummary(node) {
     };
 }
 
-// Set a (possibly dotted) property on `target`. Walk to the parent of the leaf,
-// then assign. Used for component properties like `string`, `fontSize`, etc.
-function _setDeep(target, path, value) {
-    const parts = path.split('.');
-    let cur = target;
-    for (let i = 0; i < parts.length - 1; i++) {
-        cur = cur[parts[i]];
-        if (cur == null) throw new Error('property path broke at "' + parts[i] + '"');
+// Infer the dump `type` string the editor's set-property command expects.
+// Prefer the current value's runtime type; fall back to the new value's shape.
+function _inferType(current, fallback) {
+    const v = (current !== undefined && current !== null) ? current : fallback;
+    if (v === null || v === undefined) return 'cc.Object';
+    if (typeof v === 'number') return 'Number';
+    if (typeof v === 'boolean') return 'Boolean';
+    if (typeof v === 'string') return 'String';
+    if (cc.Vec3 && v instanceof cc.Vec3) return 'cc.Vec3';
+    if (cc.Vec2 && v instanceof cc.Vec2) return 'cc.Vec2';
+    if (cc.Color && v instanceof cc.Color) return 'cc.Color';
+    if (cc.Quat && v instanceof cc.Quat) return 'cc.Quat';
+    if (typeof v === 'object') {
+        if ('x' in v && 'y' in v && 'z' in v && 'w' in v) return 'cc.Quat';
+        if ('x' in v && 'y' in v && 'z' in v) return 'cc.Vec3';
+        if ('x' in v && 'y' in v) return 'cc.Vec2';
+        if ('r' in v && 'g' in v && 'b' in v) return 'cc.Color';
+        if ('uuid' in v || '__uuid__' in v) return 'cc.Asset';
     }
-    cur[parts[parts.length - 1]] = value;
-}
-
-// Node-level transform props need engine setters (plain objects won't assign to
-// a Vec3 getter). Returns true if handled.
-function _setNodeTransform(node, prop, value) {
-    switch (prop) {
-        case 'position':
-            node.setPosition(value.x || 0, value.y || 0, value.z || 0); return true;
-        case 'x': node.x = value; return true;
-        case 'y': node.y = value; return true;
-        case 'z': node.z = value; return true;
-        case 'angle': node.angle = value; return true;
-        case 'rotation': node.angle = -value; return true;
-        case 'scale':
-            if (value && typeof value === 'object') node.setScale(value.x, value.y);
-            else node.setScale(value);
-            return true;
-        case 'scaleX': node.scaleX = value; return true;
-        case 'scaleY': node.scaleY = value; return true;
-        case 'width': node.width = value; return true;
-        case 'height': node.height = value; return true;
-        case 'anchorX': node.anchorX = value; return true;
-        case 'anchorY': node.anchorY = value; return true;
-        case 'active': node.active = !!value; return true;
-        case 'name': node.name = String(value); return true;
-        case 'opacity': node.opacity = value; return true;
-        case 'color':
-            if (value && typeof value === 'object')
-                node.color = cc.color(value.r || 0, value.g || 0, value.b || 0, value.a == null ? 255 : value.a);
-            return true;
-        default: return false;
-    }
+    return 'cc.Object';
 }
 
 // Wrap a (sync or async) function as a 2.4 scene-script message handler:
@@ -161,58 +141,38 @@ module.exports = {
         return _nodeSummary(node);
     }),
 
-    nodeCreate: _handler(function (opt) {
-        opt = opt || {};
-        const node = new cc.Node(opt.name || 'NewNode');
-        const parent = opt.parentUuid ? _node(opt.parentUuid) : _scene();
-        if (!parent) throw new Error('parent not found: ' + opt.parentUuid);
-        parent.addChild(node);
-        if (opt.position) node.setPosition(opt.position.x || 0, opt.position.y || 0, opt.position.z || 0);
-        _repaint();
-        return { created: true, uuid: node.uuid, name: node.name };
-    }),
-
-    nodeDelete: _handler(function (uuid) {
-        const node = _node(uuid);
-        if (!node) throw new Error('node not found: ' + uuid);
-        if (node === _scene()) throw new Error('cannot delete the scene root');
-        node.destroy();
-        _repaint();
-        return { deleted: true, uuid: uuid };
-    }),
-
-    nodeAddComponent: _handler(function (uuid, className) {
-        const node = _node(uuid);
-        if (!node) throw new Error('node not found: ' + uuid);
-        const comp = node.addComponent(className);
-        _repaint();
-        return { added: !!comp, uuid: uuid, component: className };
-    }),
-
-    // property: a node-level transform (e.g. "position", "angle", "active") or
-    // a component-qualified path (e.g. "cc.Label.string", "cc.Sprite.enabled").
-    nodeSetProperty: _handler(function (uuid, property, value) {
+    // Resolve a dotted `property` into the { id, path, type, on } the editor's
+    // managed `scene:set-property` command expects. Node mutations themselves are
+    // performed by main.js via that command (so they hit Undo + dirty + save);
+    // this is read-only inspection of live cc objects, returning plain JSON.
+    //   "position"          -> { id: <nodeUuid>, path: "position",  on: "node" }
+    //   "cc.Sprite.enabled" -> { id: <compUuid>, path: "enabled",   on: "cc.Sprite" }
+    nodeResolveProp: _handler(function (uuid, property) {
         const node = _node(uuid);
         if (!node) throw new Error('node not found: ' + uuid);
 
-        // Component-qualified? Find a component whose class name prefixes it.
+        // Component-qualified? Match a component whose class name prefixes it.
         const comps = node._components || [];
         for (let i = 0; i < comps.length; i++) {
             const cn = (cc.js && cc.js.getClassName) ? cc.js.getClassName(comps[i]) : null;
             if (cn && property.indexOf(cn + '.') === 0) {
-                _setDeep(comps[i], property.slice(cn.length + 1), value);
-                _repaint();
-                return { set: true, uuid: uuid, property: property, on: cn };
+                const rest = property.slice(cn.length + 1);
+                const first = rest.split('.')[0];
+                return {
+                    id: comps[i].uuid, path: rest, on: cn,
+                    type: _inferType(comps[i][first], undefined),
+                    isSubProp: rest.indexOf('.') >= 0,
+                };
             }
         }
 
-        // Node-level: transform props need engine setters; everything else is a
-        // best-effort deep assignment.
-        if (!_setNodeTransform(node, property, value)) {
-            _setDeep(node, property, value);
-        }
-        _repaint();
-        return { set: true, uuid: uuid, property: property, on: 'node' };
+        // Node-level property.
+        const first = property.split('.')[0];
+        return {
+            id: node.uuid, path: property, on: 'node',
+            type: _inferType(node[first], undefined),
+            isSubProp: property.indexOf('.') >= 0,
+        };
     }),
 
     // Run an arbitrary JS snippet with `cc` and `director` in scope. Wrapped as
