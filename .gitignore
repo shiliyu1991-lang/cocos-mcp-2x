@@ -1,0 +1,10 @@
+# Python MCP server (bundled under ./server) — machine-specific / generated.
+# The .venv is NOT portable (pyvenv.cfg hardcodes the local Python path) and is
+# large; recipients recreate it via the panel hint. Do not ship/commit it.
+server/.venv/
+
+# Python bytecode / build artifacts
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
