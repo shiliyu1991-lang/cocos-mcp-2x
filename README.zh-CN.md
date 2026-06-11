@@ -5,7 +5,7 @@
 把 LLM（Claude Desktop / Cursor 等 MCP 客户端）接入 **Cocos Creator 2.4.x** 编辑器的插件，
 让大模型能够检视并驱动你的游戏工程：读写节点、操作资源与场景、查看控制台、执行脚本。
 
-它是 [`cocos-mcp-3x`](../cocos-mcp-3x)（Creator 3.8.x 版）的 2.4.x 移植版：**相同的 Python MCP 服务器与
+它是 [`cocos-mcp-3x`](https://github.com/shiliyu1991-lang/cocos-mcp-3x)（Creator 3.8.x 版）的 2.4.x 移植版：**相同的 Python MCP 服务器与
 WebSocket 协议**，差异只在编辑器侧调用的 2.4 扩展 API。插件**自包含**：Python MCP 服务器就打包在
 插件目录内的 `./server`，扩展本身**无任何 npm 依赖、无构建步骤**。
 

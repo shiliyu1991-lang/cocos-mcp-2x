@@ -6,7 +6,7 @@ An editor extension that connects an LLM (Claude Desktop / Cursor or any MCP cli
 **Cocos Creator 2.4.x** editor, letting the model inspect and drive your game project: read/write
 nodes, operate on assets and scenes, read the console, and execute scripts.
 
-This is the 2.4.x port of [`cocos-mcp-3x`](../cocos-mcp-3x) (the Creator 3.8.x version): **the same
+This is the 2.4.x port of [`cocos-mcp-3x`](https://github.com/shiliyu1991-lang/cocos-mcp-3x) (the Creator 3.8.x version): **the same
 Python MCP server and WebSocket protocol**, differing only in the 2.4 editor APIs the extension side
 calls. The plugin is **self-contained** — the Python MCP server is bundled at `./server` — and the
 extension has **no npm dependencies and no build step**.
