@@ -53,7 +53,7 @@ Cocos Creator extension ── main.js (connects in as the WS client)
 | `manage_scene` | List / open / save / current scene (Cocos 2.x `.fire`) |
 | `manage_node` | Inspect or modify nodes in the current scene (mostly by `uuid`) |
 | `manage_asset` | Inspect and manipulate assets under `assets/` via the asset-db |
-| `read_console` | Read / clear the editor console (500-entry ring buffer) |
+| `read_console` | Read / clear the log buffer (500-entry ring) — **includes both editor logs and the running game's own logs from the browser preview** |
 | `execute_script` | Execute arbitrary JS in the editor main context (`Editor.*`) or scene context (`cc`) |
 
 > `manage_node.set_property`'s `property` may be a node-level transform (`position`, `angle`,
@@ -158,8 +158,64 @@ cocos-mcp-2x/
 - `manage_asset refresh` is **fire-and-forget**: it returns `{refreshing:true}` immediately while the
   reimport/recompile runs in the background — confirm completion via `read_console` or a re-query.
 - `manage_scene open` triggers `scene:open-by-uuid` and switches scene asynchronously.
-- `read_console` captures logs emitted by the **extension main process** via the `Editor.log`
-  family (best-effort).
+- `read_console` captures logs from the **extension main process** via the `Editor.log` family
+  (best-effort); those entries are tagged `source: "editor"`.
+
+### Browser-preview runtime logs (`source: "runtime"`)
+
+The editor process can't see the `cc.log` / `console.*` a game emits in the **browser preview**.
+After you enable "浏览器预览日志捕获 / runtime log capture" in the panel, the extension:
+
+1. Starts a lightweight HTTP receiver in the extension process (port = bridge port + 1, default `6021`);
+2. Processes the project's preview template (`<project>/preview-templates/`) and injects a reporter
+   script that hooks `console.*` (web-side `cc.log` routes through `console`) and forwards each entry
+   via `navigator.sendBeacon` into the same ring buffer, tagged `source: "runtime"`.
+
+Template handling is **in-place and non-destructive**:
+
+- If the project **already has** a preview template (`index.html` / `index.ejs` / `index.jade`, in
+  that priority), the reporter block is injected — before `</body>` for HTML/EJS, or as a `script.`
+  sibling under `body` for jade. The block is fenced with `COCOS-MCP-LOG-START / END` comments.
+- If the project has **no** template, a complete standard 2.4 `index.html` is generated (engine
+  defaults + reporter block).
+- On **disable**, only the fenced block is stripped (your template is preserved byte-for-byte); a
+  self-generated template is deleted.
+
+So `read_console` returns editor + browser-runtime logs together. While play-testing use
+`read_console(sources=["runtime"])` for game-only logs, and `levels=["error"]` for errors only
+(`window.onerror` / `unhandledrejection` are reported too).
+
+Common query filters (`read_console` params):
+
+- `sources=["runtime"]` for game logs; after editing scripts/scenes use `sources=["editor"]` for compile errors.
+- `levels=["warn","error"]` for warnings/errors only.
+- `contains="S2C_"` (or your app's log prefix) for one protocol/module. Heartbeat noise (`KeepLive` /
+  `waiting:false`) dominates — always filter with `contains` when diagnosing.
+- `since=<previous nextCursor>` to pull only new entries (good for continuous watching); `count`
+  defaults to 50, capped at 500.
+- `action="clear"` empties the buffer.
+
+`read_console` is a plain FastMCP tool exposed over stdio or `http://127.0.0.1:8799` with **no
+client-specific gating** — Cursor or any other MCP-capable IDE/AI connected to the same server reads
+the same logs.
+
+Notes:
+
+- **Enabling requires one editor restart** (Cocos caches the preview template); then preview as "Browser".
+- This only affects **preview**, not production builds (`build-templates/`).
+
+### Maintenance note: how an AI "knows" these logs exist
+
+**An AI does not read this README.** Everything it knows about a tool comes from that tool's
+`description` (and its params' `Annotated` text) — the string in `@cocos_mcp_tool(description=...)`
+inside `server/src/services/tools/<tool>.py`. That is the **only** "manual" an AI reads automatically.
+
+So when an AI "doesn't know it can read web/game logs", the fix is to **edit that tool's
+`description`** (front-load the capability, make it imperative), not the README. After editing:
+
+- Tool descriptions register **at Python server start** — you must **Stop Server → Start Server**
+  (or restart the editor) for the server to reload them;
+- MCP clients (Cursor, etc.) **cache the tool list** — reconnect / refresh tools to pick up the new description.
 
 ## Requirements
 

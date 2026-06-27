@@ -29,6 +29,7 @@
  */
 
 const net = require('net');
+const http = require('http');
 const crypto = require('crypto');
 const Path = require('path');
 const Fs = require('fs');
@@ -239,6 +240,24 @@ function _stringifyArg(a) {
     try { return JSON.stringify(a); } catch (e) { return String(a); }
 }
 
+// Append one entry to the shared ring buffer. `source` is 'editor' (this
+// extension process) or 'runtime' (a game running in the browser preview,
+// forwarded by the injected reporter). read_console can filter on it.
+function _pushLogEntry(level, message, source, timestamp) {
+    if (!_consoleBuffer) return;
+    _consoleBuffer.seq++;
+    _consoleBuffer.entries.push({
+        seq: _consoleBuffer.seq,
+        timestamp: timestamp || Date.now(),
+        level: level,
+        source: source || 'editor',
+        message: message,
+    });
+    while (_consoleBuffer.entries.length > _consoleBuffer.capacity) {
+        _consoleBuffer.entries.shift();
+    }
+}
+
 function _installConsoleHook() {
     if (_consoleBuffer) return;
     if (typeof Editor === 'undefined' || !Editor) return;
@@ -249,16 +268,7 @@ function _installConsoleHook() {
         _logOriginals[fn] = Editor[fn];
         Editor[fn] = function () {
             try {
-                _consoleBuffer.seq++;
-                _consoleBuffer.entries.push({
-                    seq: _consoleBuffer.seq,
-                    timestamp: Date.now(),
-                    level: level,
-                    message: Array.prototype.slice.call(arguments).map(_stringifyArg).join(' '),
-                });
-                while (_consoleBuffer.entries.length > _consoleBuffer.capacity) {
-                    _consoleBuffer.entries.shift();
-                }
+                _pushLogEntry(level, Array.prototype.slice.call(arguments).map(_stringifyArg).join(' '), 'editor');
             } catch (e) { /* never let logging crash */ }
             return _logOriginals[fn].apply(Editor, arguments);
         };
@@ -271,6 +281,313 @@ function _uninstallConsoleHook() {
     });
     for (const k in _logOriginals) delete _logOriginals[k];
     _consoleBuffer = null;
+}
+
+// ----------------------------------------------------------------------- //
+// 2b. Runtime (browser preview) log capture.
+//
+//   The editor-process hook above can only see this extension's own logs. A
+//   game previewed in the *browser* runs in a separate page whose cc.log /
+//   console.* output we cannot see from here. To bridge that:
+//
+//     1. We stand up a tiny HTTP receiver in this (Node) process.
+//     2. We drop a custom preview template (`<project>/preview-templates/
+//        index.ejs`) that includes the engine's default page AND a small
+//        reporter <script>. The reporter hooks console.* (cc.log routes
+//        through console on web) and ships each line to the receiver via
+//        navigator.sendBeacon. Entries land in the same ring buffer tagged
+//        source:'runtime', so read_console returns editor + runtime together.
+//
+//   Opt-in (panel button). Writing the template needs an editor restart to
+//   take effect (Cocos caches the preview template), and is removed cleanly
+//   on disable. We only ever touch a template we wrote (sentinel comment).
+// ----------------------------------------------------------------------- //
+
+const TEMPLATE_SENTINEL = 'cocos-mcp-2x runtime log reporter';
+// Markers that fence our injected block so we can strip exactly what we added
+// from a user's existing template on disable, without touching the rest.
+const LOG_START = 'COCOS-MCP-LOG-START';
+const LOG_END = 'COCOS-MCP-LOG-END';
+let _logServer = null;          // http.Server receiving runtime logs (or null)
+let _logServerPort = null;      // port it is/was bound to
+let _runtimeLogsOn = false;     // persisted opt-in flag
+
+// Runtime-log receiver port: bridge port + 1 by default (e.g. 6021). Baked
+// into the template at write time so the page knows where to POST.
+function _runtimeLogPort() { return _bridgePort() + 1; }
+
+function _startLogServer(port) {
+    if (_logServer && _logServerPort === port) return Promise.resolve(port);
+    return new Promise((resolve, reject) => {
+        try { if (_logServer) { _logServer.close(); _logServer = null; } } catch (e) { /* ignore */ }
+        const srv = http.createServer((req, res) => {
+            const cors = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type',
+            };
+            if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
+            if (req.method === 'GET') { res.writeHead(200, cors); res.end('cocos-mcp log receiver'); return; }
+            if (req.method !== 'POST') { res.writeHead(405, cors); res.end(); return; }
+            let body = '';
+            req.on('data', (c) => {
+                body += c;
+                if (body.length > 1024 * 1024) { req.destroy(); }   // 1MB cap per POST
+            });
+            req.on('end', () => {
+                try {
+                    const parsed = JSON.parse(body || '{}');
+                    const list = Array.isArray(parsed) ? parsed : [parsed];
+                    list.forEach((e) => {
+                        if (!e) return;
+                        let lvl = String(e.level || 'log');
+                        if (lvl === 'debug') lvl = 'log';
+                        if (['log', 'info', 'warn', 'error'].indexOf(lvl) === -1) lvl = 'log';
+                        _pushLogEntry(lvl, String(e.message == null ? '' : e.message),
+                            'runtime', Number(e.t) || undefined);
+                    });
+                } catch (err) { /* ignore malformed beacons */ }
+                res.writeHead(204, cors); res.end();
+            });
+            req.on('error', () => { try { res.writeHead(400, cors); res.end(); } catch (e) {} });
+        });
+        srv.on('error', (err) => { _logServer = null; reject(_err(err)); });
+        srv.listen(port, '127.0.0.1', () => {
+            _logServer = srv; _logServerPort = port; resolve(port);
+        });
+    });
+}
+
+function _stopLogServer() {
+    if (_logServer) { try { _logServer.close(); } catch (e) {} }
+    _logServer = null; _logServerPort = null;
+}
+
+function _projectPath() { return _safe(() => Editor.Project.path, null); }
+function _previewTemplateDir() {
+    const p = _projectPath();
+    return p ? Path.join(p, 'preview-templates') : null;
+}
+// The reporter's raw JS lines (no <script> tag), with the receiver port baked
+// in. Hooks console.* and window error events; cc.log goes through console on
+// web so this catches it. Reused for both HTML and jade injection.
+function _reporterJsLines(port) {
+    return [
+        '(function () {',
+        "  var EP = 'http://127.0.0.1:" + port + "/log';",
+        "  function ser(a){ try{ if(a instanceof Error) return a.stack||a.message;",
+        "    if(typeof a==='object') return JSON.stringify(a); return String(a); }catch(e){ return String(a); } }",
+        '  function send(level, args){ try{',
+        "    var p = JSON.stringify({ level: level, t: Date.now(),",
+        "      message: Array.prototype.map.call(args, ser).join(' ') });",
+        "    if (navigator.sendBeacon) navigator.sendBeacon(EP, new Blob([p], { type: 'text/plain' }));",
+        "    else fetch(EP, { method:'POST', body:p, headers:{'Content-Type':'text/plain'}, keepalive:true }).catch(function(){});",
+        '  }catch(e){} }',
+        "  ['log','info','warn','error','debug'].forEach(function(lv){",
+        '    var o = console[lv];',
+        "    console[lv] = function(){ send(lv==='debug'?'log':lv, arguments); return o && o.apply(console, arguments); };",
+        '  });',
+        "  window.addEventListener('error', function(e){ send('error', [ (e&&e.message)||'error', e&&e.filename, e&&(e.lineno+':'+e.colno) ]); });",
+        "  window.addEventListener('unhandledrejection', function(e){ send('error', ['unhandledrejection', e&&e.reason]); });",
+        "  try{ send('info', ['[cocos-mcp] runtime log reporter active @ ' + location.href]); }catch(e){}",
+        '})();',
+    ];
+}
+
+// HTML/EJS-flavoured reporter block, fenced with HTML-comment markers.
+function _reporterBlockHtml(port) {
+    return [
+        '<!-- ' + LOG_START + ' (' + TEMPLATE_SENTINEL + '; auto, removed on disable) -->',
+        '<script>',
+    ].concat(_reporterJsLines(port), [
+        '</script>',
+        '<!-- ' + LOG_END + ' -->',
+    ]).join('\n');
+}
+
+// Jade-flavoured reporter block at `indent` spaces (a `script.` literal-text
+// block), fenced with jade-comment markers so disable can strip it exactly.
+function _reporterBlockJade(port, indent) {
+    const pad = ' '.repeat(indent);
+    const jpad = ' '.repeat(indent + 2);
+    return [
+        pad + '//- ' + LOG_START + ' (' + TEMPLATE_SENTINEL + '; auto, removed on disable)',
+        pad + "script(type='text/javascript').",
+    ].concat(_reporterJsLines(port).map((l) => jpad + l), [
+        pad + '//- ' + LOG_END,
+    ]).join('\n');
+}
+
+// A full 2.4 web-preview template (EJS-rendered .html). Used only when the
+// project has NO existing preview template. Reproduces the scripts the engine's
+// built-in preview page loads (keeping the `title`/`cocos2d` variables), then
+// appends our reporter. 2.4 has no `cocosTemplate` include, so a project
+// template fully replaces the page — hence we emit the whole thing.
+function _previewTemplateHtml(port) {
+    return [
+        '<!DOCTYPE html>',
+        '<html>',
+        '<head>',
+        '  <meta charset="utf-8">',
+        '  <title><%=title%></title>',
+        '  <meta name="viewport" content="width=device-width,user-scalable=no,initial-scale=1,minimum-scale=1,maximum-scale=1">',
+        '  <link rel="stylesheet" href="app/editor/static/preview-templates/style.css">',
+        '</head>',
+        '<body>',
+        '  <div class="content" id="content"><div class="contentWrap"><div class="wrapper" id="GameDiv">',
+        '    <canvas id="GameCanvas" oncontextmenu="event.preventDefault()" tabindex="0"></canvas>',
+        '    <div id="splash"><div class="progress-bar stripes"><span style="width:0%"></span></div></div>',
+        '  </div></div></div>',
+        '  <script src="settings.js" charset="utf-8"></scr' + 'ipt>',
+        '  <script src="preview-scripts/__quick_compile__.js" charset="utf-8"></scr' + 'ipt>',
+        '  <script src="app/editor/static/preview-templates/boot.js" charset="utf-8"></scr' + 'ipt>',
+        '  <script src="/socket.io/socket.io.js" charset="utf-8"></scr' + 'ipt>',
+        '  <script>window.__socket_io__ = window.io;</scr' + 'ipt>',
+        '  <script src="app/engine/bin/<%=cocos2d%>" charset="utf-8"></scr' + 'ipt>',
+        _reporterBlockHtml(port),
+        '</body>',
+        '</html>',
+        '',
+    ].join('\n');
+}
+
+// Find the project's existing preview template, if any. Cocos renders these in
+// precedence order; we inject into whichever exists rather than add a competing
+// file (an added index.html could otherwise override a custom index.jade).
+function _findExistingTemplate() {
+    const dir = _previewTemplateDir();
+    if (!dir || !Fs.existsSync(dir)) return null;
+    const order = ['index.html', 'index.ejs', 'index.jade'];
+    for (const name of order) {
+        const f = Path.join(dir, name);
+        if (_safe(() => Fs.existsSync(f), false)) {
+            return { file: f, kind: name.split('.').pop() };   // 'html' | 'ejs' | 'jade'
+        }
+    }
+    return null;
+}
+
+// What read_console / the panel report. We may own a created index.html, or
+// have injected a fenced block into the user's existing template.
+function _ourCreatedFile() { const d = _previewTemplateDir(); return d ? Path.join(d, 'index.html') : null; }
+function _fileHasOurBlock(file) {
+    try { return Fs.readFileSync(file, 'utf8').indexOf(LOG_START) !== -1; }
+    catch (e) { return false; }
+}
+
+// Strip our fenced block (LOG_START..LOG_END inclusive) from text.
+function _stripOurBlock(text) {
+    const lines = text.split(/\r?\n/);
+    const out = [];
+    let skipping = false;
+    for (const line of lines) {
+        if (!skipping && line.indexOf(LOG_START) !== -1) { skipping = true; continue; }
+        if (skipping) { if (line.indexOf(LOG_END) !== -1) skipping = false; continue; }
+        out.push(line);
+    }
+    return out.join('\n');
+}
+
+function _writePreviewTemplate(port) {
+    const dir = _previewTemplateDir();
+    if (!dir) throw new Error('no project open — cannot write preview template');
+    const existing = _findExistingTemplate();
+
+    if (existing) {
+        let text = Fs.readFileSync(existing.file, 'utf8');
+        text = _stripOurBlock(text);   // idempotent re-inject (e.g. port changed)
+        if (existing.kind === 'jade') {
+            // Append a sibling `script.` block under <body>. Body children sit
+            // at the smallest indent used by existing body-level script lines
+            // (4 spaces in the stock template); fall back to 4.
+            const m = text.match(/^( +)script\(/m);
+            const indent = m ? m[1].length : 4;
+            text = text.replace(/\s*$/, '\n') + _reporterBlockJade(port, indent) + '\n';
+        } else {
+            // HTML/EJS: inject before </body> if present, else append.
+            const block = _reporterBlockHtml(port);
+            if (/<\/body>/i.test(text)) text = text.replace(/<\/body>/i, block + '\n</body>');
+            else text = text.replace(/\s*$/, '\n') + block + '\n';
+        }
+        Fs.writeFileSync(existing.file, text, 'utf8');
+        return { file: existing.file, mode: 'injected', kind: existing.kind };
+    }
+
+    // No existing template — create our own standalone index.html.
+    if (!Fs.existsSync(dir)) Fs.mkdirSync(dir, { recursive: true });
+    const file = _ourCreatedFile();
+    Fs.writeFileSync(file, _previewTemplateHtml(port), 'utf8');
+    return { file: file, mode: 'created', kind: 'html' };
+}
+
+function _removePreviewTemplate() {
+    const dir = _previewTemplateDir();
+    const created = _ourCreatedFile();
+
+    // A standalone index.html we created (and didn't inject into) — delete it.
+    if (created && Fs.existsSync(created) && _fileHasOurBlock(created)) {
+        const txt = _safe(() => Fs.readFileSync(created, 'utf8'), '');
+        // If stripping our block leaves only our own scaffold, it's ours to drop.
+        if (txt.indexOf(TEMPLATE_SENTINEL) !== -1 && _stripOurBlock(txt).indexOf('<%=cocos2d%>') !== -1) {
+            try { Fs.unlinkSync(created); } catch (e) { /* ignore */ }
+        }
+    }
+    // Any template (incl. the user's) that still carries our fenced block —
+    // strip just our block back out, leaving their template intact.
+    const existing = _findExistingTemplate();
+    if (existing && _fileHasOurBlock(existing.file)) {
+        try {
+            const cleaned = _stripOurBlock(Fs.readFileSync(existing.file, 'utf8')).replace(/\s*$/, '\n');
+            Fs.writeFileSync(existing.file, cleaned, 'utf8');
+        } catch (e) { /* ignore */ }
+    }
+    // Drop the folder only if we left it empty.
+    try { if (dir && Fs.existsSync(dir) && Fs.readdirSync(dir).length === 0) Fs.rmdirSync(dir); }
+    catch (e) { /* ignore */ }
+}
+
+function _runtimeLogsStatus() {
+    const existing = _findExistingTemplate();
+    const hasBlock = !!(existing && _fileHasOurBlock(existing.file));
+    // 'created' = a standalone index.html we generated (carries the full
+    // scaffold sentinel); 'injected' = our block added to a user template.
+    let mode = null;
+    if (hasBlock) {
+        const isScaffold = existing.kind === 'html' &&
+            _safe(() => Fs.readFileSync(existing.file, 'utf8').indexOf(TEMPLATE_SENTINEL) !== -1 &&
+                Fs.readFileSync(existing.file, 'utf8').indexOf('<%=cocos2d%>') !== -1, false);
+        mode = isScaffold ? 'created' : 'injected';
+    }
+    return {
+        enabled: _runtimeLogsOn,
+        receiverRunning: !!_logServer,
+        receiverPort: _logServerPort || _runtimeLogPort(),
+        templatePath: existing ? existing.file : _ourCreatedFile(),
+        templateKind: existing ? existing.kind : null,
+        templateExists: !!existing,
+        injected: hasBlock,
+        mode: mode,                 // 'created' | 'injected' | null
+        projectPath: _projectPath(),
+        restartHint: 'Restart Cocos Creator once after enabling, then preview with "Browser" selected.',
+    };
+}
+
+async function _enableRuntimeLogs() {
+    if (!_consoleBuffer) _installConsoleHook();
+    const port = _runtimeLogPort();
+    await _startLogServer(port);
+    _writePreviewTemplate(port);          // throws if a foreign template exists
+    _runtimeLogsOn = true;
+    try { const p = _profile(); p.set('runtimeLogs', true); p.save(); } catch (e) {}
+    return _runtimeLogsStatus();
+}
+
+async function _disableRuntimeLogs() {
+    _stopLogServer();
+    _removePreviewTemplate();
+    _runtimeLogsOn = false;
+    try { const p = _profile(); p.set('runtimeLogs', false); p.save(); } catch (e) {}
+    return _runtimeLogsStatus();
 }
 
 // ----------------------------------------------------------------------- //
@@ -414,6 +731,8 @@ const handlers = {
         }
         const levels = Array.isArray(params.levels) && params.levels.length
             ? new Set(params.levels) : null;
+        const sources = Array.isArray(params.sources) && params.sources.length
+            ? new Set(params.sources) : null;
         const contains = (typeof params.contains === 'string') ? params.contains : null;
         const since = (typeof params.since === 'number') ? params.since : -1;
         let count = Number.isFinite(params.count) ? Math.floor(params.count) : 50;
@@ -421,6 +740,7 @@ const handlers = {
         if (count > 500) count = 500;
         let entries = _consoleBuffer.entries.filter((e) => {
             if (levels && !levels.has(e.level)) return false;
+            if (sources && !sources.has(e.source || 'editor')) return false;
             if (contains && e.message.indexOf(contains) === -1) return false;
             if (e.seq <= since) return false;
             return true;
@@ -942,13 +1262,22 @@ module.exports = {
             if (typeof dir === 'string' && dir.trim()) _cfgServerDir = dir.trim();
             const hp = p.get('httpPort');
             if (Number.isFinite(hp)) _cfgHttpPort = hp;
+            _runtimeLogsOn = !!p.get('runtimeLogs');
         } catch (e) { /* no persisted override — use defaults */ }
+        // Re-arm the runtime-log receiver if capture was left enabled. The
+        // on-disk preview template persists across restarts; we just need the
+        // receiver listening again so its POSTs land somewhere.
+        if (_runtimeLogsOn) {
+            _startLogServer(_runtimeLogPort()).catch((e) =>
+                _editorLog('[' + PACKAGE_NAME + '] runtime-log receiver failed: ' + _err(e).message));
+        }
         _editorLog('[' + PACKAGE_NAME + '] loaded — open the panel to start the server and Connect.');
     },
 
     unload() {
         _disconnect();
         _uninstallConsoleHook();
+        _stopLogServer();
     },
 
     // IPC handlers. Each replies via event.reply(err, data); the panel's
@@ -991,6 +1320,18 @@ module.exports = {
         'panel-set-http-port'(event, port) {
             _setHttpPort(port);
             _serverStatus().then((s) => event.reply(null, s),
+                (e) => event.reply(_err(e).message));
+        },
+        'panel-runtime-logs-status'(event) {
+            try { event.reply(null, _runtimeLogsStatus()); }
+            catch (e) { event.reply(_err(e).message); }
+        },
+        'panel-enable-runtime-logs'(event) {
+            _enableRuntimeLogs().then((s) => event.reply(null, s),
+                (e) => event.reply(_err(e).message));
+        },
+        'panel-disable-runtime-logs'(event) {
+            _disableRuntimeLogs().then((s) => event.reply(null, s),
                 (e) => event.reply(_err(e).message));
         },
     },

@@ -60,6 +60,16 @@ Editor.Panel.extend({
     </div>
     <div class="state"><span class="dot" id="dot"></span><span id="status">unknown</span></div>
 
+    <div class="sep"></div>
+    <header style="font-size:12px;">浏览器预览日志捕获</header>
+    <div class="hint">开启后，往项目写入 preview-templates/index.html，把浏览器里运行的游戏 cc.log/console 日志回传，read_console 用 sources=['runtime'] 可读到。<b>开启后需重启一次编辑器</b>，预览时选「Browser」。</div>
+    <div class="row">
+        <button id="rlon" class="primary">开启捕获</button>
+        <button id="rloff">关闭捕获</button>
+    </div>
+    <div class="state"><span class="dot" id="rldot"></span><span id="rlstatus">runtime logs: unknown</span></div>
+    <div class="hint" id="rlinfo"></div>
+
     <div class="err" id="err"></div>
     <footer>The Python server is bundled in this plugin (./server). Start Server, then Connect.</footer>
 </div>`,
@@ -102,6 +112,11 @@ Editor.Panel.extend({
         disconnect: '#disconnect',
         status: '#status',
         dot: '#dot',
+        rlon: '#rlon',
+        rloff: '#rloff',
+        rldot: '#rldot',
+        rlstatus: '#rlstatus',
+        rlinfo: '#rlinfo',
         err: '#err',
     },
 
@@ -238,6 +253,51 @@ Editor.Panel.extend({
     async _poll() {
         try { this._renderServer(await ipc('panel-server-status')); } catch (e) { /* main not ready */ }
         try { this._render(await ipc('panel-status')); } catch (e) { /* idem */ }
+        try { this._renderRuntimeLogs(await ipc('panel-runtime-logs-status')); } catch (e) { /* idem */ }
+    },
+
+    // --- runtime (browser preview) log capture ---
+    _renderRuntimeLogs(s) {
+        s = s || {};
+        const on = !!s.enabled;
+        if (this.$rlstatus) {
+            this.$rlstatus.innerText = 'runtime logs: ' + (on ? 'enabled' : 'off') +
+                (on ? (s.receiverRunning ? ' · 接收中 :' + s.receiverPort : ' · 接收器未运行') : '');
+        }
+        if (this.$rldot) this.$rldot.className = 'dot ' + (on ? 'on' : 'off');
+        this._setDisabled(this.$rlon, on);
+        this._setDisabled(this.$rloff, !on);
+        if (this.$rlinfo) {
+            if (!s.projectPath) { this.$rlinfo.innerHTML = '<span class="bad">未打开项目</span>'; return; }
+            const rows = [];
+            if (s.templatePath) {
+                let tag = '(未写入)';
+                if (s.mode === 'injected') tag = '<span class="ok">(已注入到现有 ' + (s.templateKind || '') + ' 模板)</span>';
+                else if (s.mode === 'created') tag = '<span class="ok">(已生成)</span>';
+                else if (s.templateExists) tag = '(现有 ' + (s.templateKind || '') + ' 模板，未注入)';
+                rows.push('模板: ' + s.templatePath + '  ' + tag);
+            }
+            if (on) rows.push('提示: ' + (s.restartHint || ''));
+            this.$rlinfo.innerHTML = rows.join('\n');
+        }
+    },
+    async _enableRuntimeLogs() {
+        try {
+            this._setDisabled(this.$rlon, true);
+            this._renderRuntimeLogs(await ipc('panel-enable-runtime-logs'));
+        } catch (e) {
+            this.$err.innerText = String(e && e.message ? e.message : e);
+            this._setDisabled(this.$rlon, false);
+        }
+    },
+    async _disableRuntimeLogs() {
+        try {
+            this._setDisabled(this.$rloff, true);
+            this._renderRuntimeLogs(await ipc('panel-disable-runtime-logs'));
+        } catch (e) {
+            this.$err.innerText = String(e && e.message ? e.message : e);
+            this._setDisabled(this.$rloff, false);
+        }
     },
 
     ready() {
@@ -274,6 +334,8 @@ Editor.Panel.extend({
         if (this.$stop) this.$stop.addEventListener('click', () => this._stop());
         if (this.$connect) this.$connect.addEventListener('click', () => this._connect());
         if (this.$disconnect) this.$disconnect.addEventListener('click', () => this._disconnect());
+        if (this.$rlon) this.$rlon.addEventListener('click', () => this._enableRuntimeLogs());
+        if (this.$rloff) this.$rloff.addEventListener('click', () => this._disableRuntimeLogs());
 
         this._poll();
         this._timer = setInterval(() => this._poll(), 1500);

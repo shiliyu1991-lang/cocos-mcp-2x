@@ -49,7 +49,7 @@ Cocos Creator 扩展     ── main.js（作为 WS 客户端连入）
 | `manage_scene` | 列出 / 打开 / 保存 / 当前场景（Cocos 2.x `.fire`） |
 | `manage_node` | 检视或修改当前场景中的节点（多数操作按 `uuid`） |
 | `manage_asset` | 通过 asset-db 检视和操作 `assets/` 下的资源 |
-| `read_console` | 读取 / 清空编辑器控制台（500 条环形缓冲） |
+| `read_console` | 读取 / 清空日志缓冲（500 条环形）——**同时含编辑器日志和浏览器预览里游戏自己的运行时日志** |
 | `execute_script` | 在编辑器主上下文（`Editor.*`）或场景上下文（`cc`）执行任意 JS |
 
 > `manage_node.set_property` 的 `property` 可以是节点级变换（如 `position`、`angle`、`active`、
@@ -155,7 +155,52 @@ cocos-mcp-2x/
 - `manage_asset refresh` 是 **fire-and-forget**：立即返回 `{refreshing:true}`，刷新/重编译在后台进行，
   用 `read_console` 或重新查询确认完成。
 - `manage_scene open` 通过 `scene:open-by-uuid` 触发，异步切换场景。
-- `read_console` 捕获的是**扩展主进程**经由 `Editor.log` 家族输出的日志（尽力而为）。
+- `read_console` 默认捕获的是**扩展主进程**经由 `Editor.log` 家族输出的日志（尽力而为），这些条目 `source: "editor"`。
+
+### 浏览器预览运行时日志（`source: "runtime"`）
+
+编辑器进程看不到游戏在**浏览器预览**里跑出来的 `cc.log` / `console.*`。面板「浏览器预览日志捕获」
+开启后会：
+
+1. 在扩展进程内起一个轻量 HTTP 接收器（端口 = bridge 端口 + 1，默认 `6021`）；
+2. 处理项目的预览模板（`<project>/preview-templates/`），插入一段上报脚本。该脚本 hook
+   `console.*`（web 端 `cc.log` 会走 `console`）并通过 `navigator.sendBeacon` 把每条日志回传给接收器，
+   落进同一个环形缓冲、标记 `source: "runtime"`。
+
+模板处理是**就地注入、不破坏你的自定义模板**：
+
+- 若项目**已有**预览模板（`index.html` / `index.ejs` / `index.jade`，按此优先级），就把上报块
+  注入进去——HTML/EJS 插在 `</body>` 前，jade 作为 `body` 下的一个 `script.` 兄弟块追加。
+  注入块用 `COCOS-MCP-LOG-START / END` 注释围栏标记。
+- 若项目**没有**模板，才生成一个完整的标准 2.4 `index.html`（含引擎默认脚本 + 上报块）。
+- **关闭**时只把围栏内的注入块剥离（你的模板原样保留，可逐字节还原）；自己生成的那份则删除。
+
+于是 `read_console` 能同时读到编辑器与浏览器运行时日志；play-test 时用 `read_console(sources=["runtime"])`
+只看游戏自己的日志，用 `levels=["error"]` 只看报错（`window.onerror` / `unhandledrejection` 也会上报）。
+
+常用查询过滤（`read_console` 参数）：
+
+- `sources=["runtime"]` 看游戏日志；改完脚本/场景后用 `sources=["editor"]` 查编译报错。
+- `levels=["warn","error"]` 只看告警/报错。
+- `contains="S2C_"`（或你 App 的日志前缀）只看某协议/模块。心跳噪音（`KeepLive` / `waiting:false`）很多，排查时务必配合 `contains` 过滤。
+- `since=<上次返回的 nextCursor>` 只拉新增条目，适合连续盯盘；`count` 默认 50、上限 500。
+- `action="clear"` 清空缓冲。
+
+`read_console` 是注册在 FastMCP 上的普通 MCP 工具，经 stdio 或 `http://127.0.0.1:8799` 暴露，**不做任何「只认某个客户端」的校验**——Cursor 或其它支持 MCP 的 IDE/AI 连上同一个 server 都能照样读到这些日志。
+
+注意：
+
+- **开启后需重启一次 Cocos Creator**（编辑器会缓存预览模板），之后预览时选「Browser」运行。
+- 该处理仅作用于**预览**，不影响正式构建（`build-templates/`）。
+
+### 维护备注：AI 怎么「知道」有这些日志
+
+**AI 不读本 README**——它对每个工具的全部认知，来自该工具的 `description`（以及参数的 `Annotated` 说明）。也就是 `server/src/services/tools/<工具>.py` 里 `@cocos_mcp_tool(description=...)` 那段文本，**这是 AI 唯一会自动读到的「说明书」**。
+
+所以当出现「AI 不知道能看网页/游戏日志」这类问题时，正确的修法是**改对应工具的 `description`**（把能力前置、写成指令式），而不是改 README。改完后：
+
+- 工具描述在 **Python server 启动时注册**，必须 **Stop Server → Start Server**（或重启编辑器）让 server 重新加载；
+- MCP 客户端（Cursor 等）会**缓存工具列表**，需**重新连接 / 刷新工具**才能拿到新描述。
 
 ## 环境要求
 
