@@ -56,6 +56,11 @@ Cocos Creator extension ── main.js (connects in as the WS client)
 | `read_console` | Read / clear the log buffer (500-entry ring) — **includes both editor logs and the running game's own logs from the browser preview** |
 | `execute_script` | Execute arbitrary JS in the editor main context (`Editor.*`) or scene context (`cc`) |
 
+> **Reading logs? Always use `read_console`.** It returns both editor logs and the running game's
+> browser-preview console (`cc.log` / `console.*`); pass `sources=["runtime"]` for game-only,
+> `levels=["error"]` for errors. Do **not** use a generic browser-automation tool (e.g.
+> claude-in-chrome) to read a Cocos game's console — it can't reach the editor's preview tab.
+
 > `manage_node.set_property`'s `property` may be a node-level transform (`position`, `angle`,
 > `active`, `color`) or a component-qualified path (`cc.Label.string`, `cc.Sprite.enabled`). For
 > asset-typed properties (e.g. spriteFrame), set them via `execute_script` in the scene context.

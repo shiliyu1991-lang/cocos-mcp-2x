@@ -52,6 +52,10 @@ Cocos Creator 扩展     ── main.js（作为 WS 客户端连入）
 | `read_console` | 读取 / 清空日志缓冲（500 条环形）——**同时含编辑器日志和浏览器预览里游戏自己的运行时日志** |
 | `execute_script` | 在编辑器主上下文（`Editor.*`）或场景上下文（`cc`）执行任意 JS |
 
+> **读日志一律用 `read_console`。** 它同时返回编辑器日志和运行中游戏在浏览器预览里的控制台
+> （`cc.log` / `console.*`）；只看游戏日志传 `sources=["runtime"]`，只看报错加 `levels=["error"]`。
+> **不要**用通用浏览器自动化工具（如 claude-in-chrome）去读 Cocos 游戏的控制台——它够不到编辑器的预览标签页。
+
 > `manage_node.set_property` 的 `property` 可以是节点级变换（如 `position`、`angle`、`active`、
 > `color`），也可以是组件限定路径（如 `cc.Label.string`、`cc.Sprite.enabled`）。资源型属性
 > （如 spriteFrame）请用 `execute_script` 在场景上下文里设置。
